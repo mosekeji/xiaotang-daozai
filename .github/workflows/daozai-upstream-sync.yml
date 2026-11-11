@@ -29,7 +29,8 @@ env:
   MIRROR: mosekeji/xiaotang-daozai
   BRANCH: main
   WORKFLOW_FILE: .github/workflows/daozai-upstream-sync.yml
-  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  # GITHUB_TOKEN 不允许推送含 .github/workflows 变更的引用，因此使用带 workflow 权限的专用 Secret
+  GH_TOKEN: ${{ secrets.DAOZAI_SYNC_TOKEN }}
 
 jobs:
   mirror:
@@ -41,6 +42,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          token: ${{ secrets.DAOZAI_SYNC_TOKEN }}
 
       - name: 配置 Git
         run: |
