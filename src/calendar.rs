@@ -4,7 +4,7 @@
 //! 企业微信使用 FolderSync / Sync；复用 VEVENT 解析与重复日程展开。认证使用 Basic Auth，
 //! 没有 OAuth、没有回调，用户在客户端自己生成账号密码即可。
 //!
-//! 硬约束：只读；凭据只进 Windows 凭据管理器（`keyring`，和邮件同一套库），
+//! 硬约束：只读；凭据不进配置文件（Windows 下用 DPAPI 加密单独存放），
 //! 配置文件里只有平台、用户名、日历地址；不落盘正文、不进日志。
 
 mod exchange;
@@ -219,24 +219,91 @@ pub fn forget_config() -> Result<(), String> {
 
 // ---------------------------------------------------------------- 凭据
 
+/// 内网版：不依赖系统凭据管理器（已移除 keyring 依赖），密码用 DPAPI
+/// 加密后落在配置目录的 `calendar-secrets.json`，与配置文件同一信任域。
 #[cfg(windows)]
 pub mod secrets {
-    /// 凭据只进 Windows 凭据管理器；键是「平台:用户名」，值是密码。
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use windows::Win32::{
+        Foundation::{HLOCAL, LocalFree},
+        Security::Cryptography::{CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN},
+    };
+
+    fn store_path() -> Option<std::path::PathBuf> {
+        super::config_path().ok().map(|p| p.with_file_name("calendar-secrets.json"))
+    }
+
+    fn load_store() -> std::collections::BTreeMap<String, String> {
+        store_path()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|raw| serde_json::from_slice(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_store(store: &std::collections::BTreeMap<String, String>) -> Result<(), String> {
+        let path = store_path().ok_or_else(|| "无法定位配置目录".to_string())?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败：{e}"))?;
+        }
+        let data = serde_json::to_vec(store).map_err(|e| format!("序列化凭据失败：{e}"))?;
+        crate::model::atomic_write(&path, &data).map_err(|e| format!("写凭据失败：{e}"))
+    }
+
+    fn protect(plain: &str) -> Result<String, String> {
+        let mut input_bytes = plain.as_bytes().to_vec();
+        let input = CRYPT_INTEGER_BLOB {
+            cbData: input_bytes.len() as u32,
+            pbData: input_bytes.as_mut_ptr(),
+        };
+        let mut output = CRYPT_INTEGER_BLOB::default();
+        unsafe {
+            CryptProtectData(&input, None, None, None, None, CRYPTPROTECT_UI_FORBIDDEN, &mut output)
+                .map_err(|e| format!("加密密码失败：{e}"))?;
+        }
+        if output.pbData.is_null() {
+            return Err("加密密码失败".into());
+        }
+        let sealed = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+        unsafe { let _ = LocalFree(HLOCAL(output.pbData.cast())); }
+        Ok(STANDARD.encode(sealed))
+    }
+
+    fn unprotect(encoded: &str) -> Result<String, String> {
+        let mut sealed = STANDARD.decode(encoded).map_err(|e| format!("解码凭据失败：{e}"))?;
+        let input = CRYPT_INTEGER_BLOB {
+            cbData: sealed.len() as u32,
+            pbData: sealed.as_mut_ptr(),
+        };
+        let mut output = CRYPT_INTEGER_BLOB::default();
+        unsafe {
+            CryptUnprotectData(&input, None, None, None, None, CRYPTPROTECT_UI_FORBIDDEN, &mut output)
+                .map_err(|_| "没有保存密码".to_string())?;
+        }
+        if output.pbData.is_null() {
+            return Err("没有保存密码".into());
+        }
+        let plain = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+        unsafe { let _ = LocalFree(HLOCAL(output.pbData.cast())); }
+        String::from_utf8(plain).map_err(|_| "凭据内容损坏".to_string())
+    }
+
     pub fn save(cfg: &super::Config, password: &str) -> Result<(), String> {
-        let entry = keyring::Entry::new(super::SERVICE, &name(cfg))
-            .map_err(|e| format!("凭据管理器不可用：{e}"))?;
-        entry.set_password(password).map_err(|e| format!("保存密码失败：{e}"))
+        let mut store = load_store();
+        store.insert(name(cfg), protect(password)?);
+        save_store(&store)
     }
 
     pub fn load(cfg: &super::Config) -> Result<String, String> {
-        let entry = keyring::Entry::new(super::SERVICE, &name(cfg))
-            .map_err(|e| format!("凭据管理器不可用：{e}"))?;
-        entry.get_password().map_err(|_| "没有保存密码".to_string())
+        let store = load_store();
+        let encoded = store.get(&name(cfg)).ok_or_else(|| "没有保存密码".to_string())?;
+        unprotect(encoded)
     }
 
     pub fn delete(cfg: &super::Config) {
-        if let Ok(entry) = keyring::Entry::new(super::SERVICE, &name(cfg)) {
-            let _ = entry.delete_credential();
+        let key = name(cfg);
+        let mut store = load_store();
+        if store.remove(&key).is_some() {
+            let _ = save_store(&store);
         }
     }
 
