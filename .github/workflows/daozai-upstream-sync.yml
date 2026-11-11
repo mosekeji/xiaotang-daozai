@@ -1,0 +1,173 @@
+name: 上游同步 · Release 镜像
+
+on:
+  schedule:
+    # 每 30 分钟检查一次上游。GitHub 定时任务在高峰期可能有额外延迟。
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      release_limit:
+        description: '镜像上游最近几个 Release（默认 10）'
+        required: false
+        default: '10'
+        type: string
+      refresh_notes:
+        description: '同时刷新已存在 Release 的说明文字'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daozai-upstream-mirror
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: Renly1994/xiaotang-daozai
+  MIRROR: mosekeji/xiaotang-daozai
+  BRANCH: main
+  WORKFLOW_FILE: .github/workflows/daozai-upstream-sync.yml
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: 检出镜像仓库
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: 配置 Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # 工作流文件本身存放在被同步的 main 分支上，所以用 merge 而不是 force push：
+      # 这样既纳入上游全部提交，又保留本仓库独有的这一个文件，任何自定义改动都不会被覆盖。
+      - name: 同步上游 main 并补齐标签
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$WORKFLOW_FILE" /tmp/daozai-sync-workflow.yml
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git fetch upstream "+refs/heads/${BRANCH}:refs/remotes/upstream/${BRANCH}" --tags
+
+          git checkout -B "${BRANCH}" "origin/${BRANCH}"
+          UP_SHA=$(git rev-parse "upstream/${BRANCH}")
+          echo "上游 HEAD: ${UP_SHA}"
+
+          if git merge-base --is-ancestor "upstream/${BRANCH}" HEAD; then
+            echo "::notice::上游无新提交，分支已是最新"
+          else
+            git merge --no-edit "upstream/${BRANCH}"
+            mkdir -p "$(dirname "$WORKFLOW_FILE")"
+            cp /tmp/daozai-sync-workflow.yml "$WORKFLOW_FILE"
+            git add "$WORKFLOW_FILE"
+            if ! git diff --cached --quiet; then
+              git commit -m "chore: 保留上游同步工作流 [skip ci]"
+            fi
+            git push origin "HEAD:${BRANCH}"
+            echo "::notice::已合并上游 ${UP_SHA}"
+          fi
+
+          # 只推送远端缺失的标签，绝不覆盖已有标签
+          ORIGIN_TAGS=$(git ls-remote --tags origin | awk '{print $2}')
+          pushed=0
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            grep -qxF "refs/tags/${tag}" <<< "$ORIGIN_TAGS" && continue
+            git push origin "refs/tags/${tag}:refs/tags/${tag}"
+            pushed=$((pushed + 1))
+          done < <(git tag --list 'v*')
+          echo "::notice::新增标签 ${pushed} 个"
+
+      # 复用上游已构建好的安装包与 SHA256SUMS.txt，二者校验值天然一致；
+      # 避免在 fork 上重跑 Windows + Rust + NSIS 构建链。
+      - name: 镜像上游 Release 与安装包
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_LIMIT="${{ github.event.inputs.release_limit }}"
+          [ -z "$RELEASE_LIMIT" ] && RELEASE_LIMIT=10
+          REFRESH_NOTES="${{ github.event.inputs.refresh_notes }}"
+          [ -z "$REFRESH_NOTES" ] && REFRESH_NOTES=false
+
+          build_notes() {
+            {
+              echo "> 本版本由自动同步工作流镜像自上游 [${UPSTREAM}](https://github.com/${UPSTREAM})，安装包与校验文件与上游一致。"
+              echo
+              cat /tmp/up-notes.md
+            } > /tmp/final-notes.md
+          }
+
+          mapfile -t TAGS < <(gh release list --repo "$UPSTREAM" \
+            --limit "$RELEASE_LIMIT" --exclude-drafts --exclude-pre-releases \
+            --json tagName --jq '.[].tagName')
+          echo "待检查的上游 Release: ${TAGS[*]:-（无）}"
+
+          for tag in "${TAGS[@]}"; do
+            [ -z "$tag" ] && continue
+
+            if gh release view "$tag" --repo "$MIRROR" >/dev/null 2>&1; then
+              if [ "$REFRESH_NOTES" = "true" ]; then
+                gh release view "$tag" --repo "$UPSTREAM" --json body --jq '.body // ""' > /tmp/up-notes.md
+                build_notes
+                gh release edit "$tag" --repo "$MIRROR" --notes-file /tmp/final-notes.md >/dev/null
+                echo "已刷新说明: $tag"
+              else
+                echo "已存在，跳过: $tag"
+              fi
+              continue
+            fi
+
+            # 创建 Release 前确认标签已在远端（--verify-tag 依赖它）
+            if ! git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+              if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+                git push origin "refs/tags/$tag:refs/tags/$tag"
+              fi
+            fi
+
+            rm -rf "dist/$tag"
+            mkdir -p "dist/$tag"
+            if ! gh release download "$tag" --repo "$UPSTREAM" --dir "dist/$tag" --clobber; then
+              echo "::warning::下载上游资产失败，跳过 $tag，下次运行会自动重试"
+              continue
+            fi
+
+            gh release view "$tag" --repo "$UPSTREAM" --json body --jq '.body // ""' > /tmp/up-notes.md
+            TITLE=$(gh release view "$tag" --repo "$UPSTREAM" --json name --jq '.name // ""')
+            [ -z "$TITLE" ] && TITLE="$tag"
+            build_notes
+
+            shopt -s nullglob
+            ASSETS=("dist/$tag"/*)
+            shopt -u nullglob
+            if [ "${#ASSETS[@]}" -gt 0 ]; then
+              gh release create "$tag" --repo "$MIRROR" --title "$TITLE" \
+                --notes-file /tmp/final-notes.md --verify-tag "${ASSETS[@]}"
+            else
+              gh release create "$tag" --repo "$MIRROR" --title "$TITLE" \
+                --notes-file /tmp/final-notes.md --verify-tag
+            fi
+            echo "::notice::已创建 Release ${tag}（${#ASSETS[@]} 个资产）"
+          done
+
+      - name: 输出摘要
+        if: success()
+        shell: bash
+        run: |
+          {
+            echo "## 岛仔上游同步结果"
+            echo "- 上游：[\`${UPSTREAM}\`](https://github.com/${UPSTREAM})"
+            echo "- 镜像：[\`${MIRROR}\`](https://github.com/${MIRROR})"
+            echo "- 当前 main：\`$(git rev-parse --short HEAD)\`"
+            echo "- 最新 Release：\`$(gh release view --repo "$MIRROR" --json tagName --jq .tagName 2>/dev/null || echo 无)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
