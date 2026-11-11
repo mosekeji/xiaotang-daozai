@@ -229,19 +229,19 @@ pub mod secrets {
         Security::Cryptography::{CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN},
     };
 
-    fn store_path() -> Option<std::path::PathBuf> {
-        super::config_path().ok().map(|p| p.with_file_name("calendar-secrets.json"))
+    fn store_path() -> std::path::PathBuf {
+        super::config_path().with_file_name("calendar-secrets.json")
     }
 
     fn load_store() -> std::collections::BTreeMap<String, String> {
-        store_path()
-            .and_then(|p| std::fs::read(p).ok())
+        std::fs::read(store_path())
+            .ok()
             .and_then(|raw| serde_json::from_slice(&raw).ok())
             .unwrap_or_default()
     }
 
     fn save_store(store: &std::collections::BTreeMap<String, String>) -> Result<(), String> {
-        let path = store_path().ok_or_else(|| "无法定位配置目录".to_string())?;
+        let path = store_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败：{e}"))?;
         }
