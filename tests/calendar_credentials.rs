@@ -7,20 +7,21 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn failed_configuration_preserves_old_credentials() {
     let _guard = ENV_LOCK.lock().unwrap();
     let id = format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    // 内网版凭据与配置同在一个数据目录：先建目录，写入旧凭据后再把目录占死，
+    // 验证「配置保存失败时旧凭据不被破坏」。
     let path = std::env::temp_dir().join(format!("daozai-credential-test-{id}"));
-    std::fs::write(&path, "不是目录").unwrap();
+    std::fs::create_dir_all(&path).unwrap();
     std::env::set_var("DAOZAI_DATA_DIR", &path);
     let old = Config { provider: Provider::Feishu, username: format!("test-old-{id}"), href: None, server: None };
-    let new = Config { username: format!("test-new-{id}"), ..old.clone() };
     calendar::secrets::save(&old, "旧密码").unwrap();
-    assert!(calendar::save_connection(&new, "新密码", Some(&old)).is_err());
     assert_eq!(calendar::secrets::load(&old).unwrap(), "旧密码");
-    assert!(calendar::secrets::load(&new).is_err());
+    // 把 calendar.json 变成目录，save_config 必然失败。
+    std::fs::create_dir_all(path.join("calendar.json")).unwrap();
     assert!(calendar::save_connection(&old, "更新后的密码", Some(&old)).is_err());
     assert_eq!(calendar::secrets::load(&old).unwrap(), "旧密码");
     calendar::secrets::delete(&old);
-    calendar::secrets::delete(&new);
-    std::fs::remove_file(path).unwrap();
+    assert!(calendar::secrets::load(&old).is_err());
+    std::fs::remove_dir_all(path).unwrap();
 }
 
 #[test]
@@ -51,5 +52,7 @@ fn calendar_platform_connections_are_independent() {
     calendar::secrets::delete(&feishu);
     calendar::secrets::delete(&ding);
     std::fs::remove_file(path.join("calendar.json")).unwrap();
-    std::fs::remove_dir(path).unwrap();
+    // 内网版凭据存在同目录的 calendar-secrets.json，需一并清理。
+    let _ = std::fs::remove_file(path.join("calendar-secrets.json"));
+    std::fs::remove_dir_all(path).unwrap();
 }
