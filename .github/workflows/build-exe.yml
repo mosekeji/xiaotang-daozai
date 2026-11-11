@@ -1,0 +1,33 @@
+name: 构建内网版 EXE
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      CARGO_BUILD_JOBS: 1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: intranet
+      - name: 安装 Rust stable
+        run: rustup toolchain install stable --profile minimal
+      - name: 构建发布版
+        run: cargo +stable build --locked --release --bin daozai --target x86_64-pc-windows-msvc
+      - name: 检查运行库
+        shell: pwsh
+        run: ./scripts/check-runtime.ps1 -Executable ./target/x86_64-pc-windows-msvc/release/daozai.exe
+      - name: 打包
+        shell: pwsh
+        run: |
+          $version = [regex]::Match((Get-Content Cargo.toml -Raw), '(?m)^version = "([^"]+)"').Groups[1].Value
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item ./target/x86_64-pc-windows-msvc/release/daozai.exe "dist/Daozai-Intranet-v$version-x64.exe"
+          Get-FileHash "dist/Daozai-Intranet-v$version-x64.exe" -Algorithm SHA256 | Format-List
+      - uses: actions/upload-artifact@v4
+        with:
+          name: daozai-intranet-exe
+          path: dist/*.exe
+          if-no-files-found: error
