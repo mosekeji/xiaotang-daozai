@@ -162,6 +162,19 @@ jobs:
             echo "::notice::已创建 Release ${tag}（${#ASSETS[@]} 个资产）"
           done
 
+      # 批量补历史版本时，最后创建的往往是最旧的一版，需显式指定 latest
+      - name: 标记最新版本
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          LATEST=$(gh release list --repo "$UPSTREAM" --limit 1 \
+            --exclude-drafts --exclude-pre-releases --json tagName --jq '.[0].tagName')
+          [ -z "$LATEST" ] && exit 0
+          RID=$(gh api "repos/$MIRROR/releases/tags/$LATEST" --jq .id)
+          gh api -X PATCH "repos/$MIRROR/releases/$RID" -F make_latest=true >/dev/null
+          echo "::notice::已将 ${LATEST} 标记为最新 Release"
+
       - name: 输出摘要
         if: success()
         shell: bash
